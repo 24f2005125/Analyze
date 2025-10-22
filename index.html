@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Repo helper — validate & fix attachments</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 24px; color: #111; }
+    h1 { margin-top: 0; }
+    .box { border: 1px solid #ddd; padding: 16px; border-radius: 8px; margin-bottom: 16px; background: #fafafa; }
+    .error { border-color: #e66; background: #fff0f0; color: #800; }
+    .ok { border-color: #6c6; background: #f6fff6; color: #064; }
+    pre { background: #111; color: #0f0; padding: 12px; overflow: auto; max-height: 300px; border-radius: 6px; }
+    button { padding: 8px 12px; margin: 6px 0; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    .small { font-size:0.9rem; color:#444; }
+    a.download { display:inline-block; margin-left:8px; }
+    ul { margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Repository Attachments Inspector</h1>
+  <div id="app" class="box">
+    <p class="small">This page inspects the attachments provided with the task, detects issues, and helps produce corrected files that should be committed to the repository.</p>
+    <div id="status" class="box"></div>
+    <div id="actions" class="box"></div>
+    <div id="log" class="box"><strong>Console log:</strong><pre id="console">Initializing...</pre></div>
+  </div>
+
+  <script>
+(function () {
+  // Strict DOM presence validation
+  function mustHave(id) {
+    const el = document.getElementById(id);
+    if (!el) {
+      const msg = 'Required DOM element #' + id + ' is missing. The page cannot continue.';
+      document.body.innerHTML = '<div style="border:2px solid #e66; padding:20px; background:#fff0f0; color:#800;">' + msg + '</div>';
+      console.error(msg);
+      throw new Error(msg);
+    }
+    return el;
+  }
+
+  const statusEl = mustHave('status');
+  const actionsEl = mustHave('actions');
+  const consolePre = mustHave('console');
+
+  function clog(...args) {
+    console.log(...args);
+    try {
+      consolePre.textContent += args.map(a => (typeof a === 'string' ? a : JSON.stringify(a, null, 2))).join(' ') + '\n';
+    } catch (err) {
+      console.error('Failed to write to on-page console:', err);
+    }
+  }
+
+  // Attachments (authoritative list provided)
+  const ATTACHMENTS = {
+    execute: './35f0c98f-cfd1-4781-87d5-a863bacaafb3-execute.py',
+    xlsx: './739e1fa5-f5e2-4958-a2fd-3ff946f6d23c-data.xlsx'
+  };
+
+  const REQUIRED_REPO_FILES = [
+    './data.csv',
+    './.github/workflows/ci.yml'
+  ];
+
+  // UI helpers
+  function setStatus(html, isError = false) {
+    statusEl.innerHTML = '';
+    const div = document.createElement('div');
+    div.className = 'box ' + (isError ? 'error' : 'ok');
+    div.innerHTML = html;
+    statusEl.appendChild(div);
+  }
+
+  function setActions(nodes) {
+    actionsEl.innerHTML = '';
+    const div = document.createElement('div');
+    div.appendChild(nodes);
+    actionsEl.appendChild(div);
+  }
+
+  // Fetch file as text with graceful errors
+  async function fetchText(url) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        clog('fetchText failed:', url, res.status);
+        return { ok: false, status: res.status, statusText: res.statusText };
+      }
+      const txt = await res.text();
+      clog('Fetched', url, '(', txt.length, 'bytes )');
+      return { ok: true, text: txt };
+    } catch (err) {
+      clog('fetchText error', url, err);
+      return { ok: false, error: String(err) };
+    }
+  }
+
+  // Fetch as arrayBuffer (for xlsx)
+  async function fetchArrayBuffer(url) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        clog('fetchArrayBuffer failed:', url, res.status);
+        return { ok: false, status: res.status, statusText: res.statusText };
+      }
+      const ab = await res.arrayBuffer();
+      clog('Fetched (arrayBuffer) ', url, '(', ab.byteLength, 'bytes )');
+      return { ok: true, buffer: ab };
+    } catch (err) {
+      clog('fetchArrayBuffer error', url, err);
+      return { ok: false, error: String(err) };
+    }
+  }
+
+  // Attempt to fetch required repo files to see if they already exist
+  async function checkRequiredRepoFiles() {
+    const results = {};
+    for (const path of REQUIRED_REPO_FILES) {
+      try {
+        const res = await fetch(path, { method: 'HEAD' });
+        results[path] = { ok: res.ok, status: res.status };
+        clog('HEAD', path, '->', res.status);
+      } catch (err) {
+        clog('HEAD error', path, err);
+        results[path] = { ok: false, error: String(err) };
+      }
+    }
+    return results;
+  }
+
+  // Download helper
+  function download(filename, content, mime='application/octet-stream') {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+
+  // Load SheetJS library from CDN
+  function loadXLSX() {
+    return new Promise((resolve, reject) => {
+      if (window.XLSX) return resolve(window.XLSX);
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js';
+      script.onload = () => {
+        clog('Loaded SheetJS from CDN');
+        resolve(window.XLSX);
+      };
+      script.onerror = (e) => {
+        clog('Failed to load SheetJS library', e);
+        reject(new Error('Failed to load SheetJS from CDN'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  async function main() {
+    consolePre.textContent = '';
+    clog('Starting inspector...');
+
+    // Check for required repo files presence
+    const repoChecks = await checkRequiredRepoFiles();
+
+    // Fetch attachments per authoritative list
+    const exeRes = await fetchText(ATTACHMENTS.execute);
+    const xlsxRes = await fetchArrayBuffer(ATTACHMENTS.xlsx);
+
+    // Collate status info
+    const missing = [];
+    if (!exeRes.ok) missing.push({ name: 'execute.py', url: ATTACHMENTS.execute, reason: exeRes.status || exeRes.error });
+    if (!xlsxRes.ok) missing.push({ name: 'data.xlsx', url: ATTACHMENTS.xlsx, reason: xlsxRes.status || xlsxRes.error });
+
+    // Check for missing required repo files
+    const missingRepoFiles = Object.entries(repoChecks).filter(([p, info]) => !info.ok).map(([p, info]) => ({ path: p, info }));
+
+    // Display summary
+    let summaryHtml = '<strong>Checked attachments:</strong><ul>';
+    summaryHtml += `<li>execute.py: ${exeRes.ok ? 'found' : 'MISSING/UNREACHABLE'} (${ATTACHMENTS.execute})</li>`;
+    summaryHtml += `<li>data.xlsx: ${xlsxRes.ok ? 'found' : 'MISSING/UNREACHABLE'} (${ATTACHMENTS.xlsx})</li>`;
+    summaryHtml += '</ul>';
+
+    summaryHtml += '<strong>Repository files that are expected but were not found:</strong><ul>';
+    for (const m of missingRepoFiles) {
+      summaryHtml += `<li>${m.path} (status: ${m.info.status || 'error'})</li>`;
+    }
+    summaryHtml += '</ul>';
+
+    // If any core attachments missing, show error block and stop further processing
+    if (missing.length > 0) {
+      let html = '<strong>ERROR:</strong> One or more required attachments could not be fetched:<ul>';
+      for (const m of missing) {
+        html += `<li>${m.name} at ${m.url} — reason: ${m.reason}</li>`;
+      }
+      html += '</ul>';
+      html += summaryHtml;
+      setStatus(html, true);
+      console.error('Missing attachments:', missing);
+      return;
+    }
+
+    // Process execute.py
+    const exeText = exeRes.text;
+    clog('execute.py size', exeText.length);
+
+    // Detect typo "revenew"
+    const typo = 'revenew';
+    const hasTypo = exeText.includes(typo);
+    if (hasTypo) {
+      clog('Typo detected:', JSON.stringify(typo));
+    } else {
+      clog('No occurrence of', JSON.stringify(typo), 'found in execute.py');
+    }
+
+    // Process xlsx => CSV using SheetJS
+    let XLSXlib;
+    try {
+      XLSXlib = await loadXLSX();
+    } catch (err) {
+      const msg = '<strong>ERROR:</strong> Failed to load XLSX parser from CDN. Cannot convert data.xlsx to CSV. Check network or CDN availability.';
+      setStatus(msg, true);
+      console.error(msg, err);
+      return;
+    }
+
+    // Parse workbook
+    let workbook;
+    try {
+      workbook = XLSXlib.read(new Uint8Array(xlsxRes.buffer), { type: 'array' });
+      clog('Workbook parsed. Sheets:', workbook.SheetNames);
+    } catch (err) {
+      const msg = '<strong>ERROR:</strong> Failed to parse data.xlsx. Reason: ' + String(err);
+      setStatus(msg, true);
+      console.error(msg, err);
+      return;
+    }
+
+    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+      const msg = '<strong>ERROR:</strong> data.xlsx contains no sheets.';
+      setStatus(msg, true);
+      console.error(msg);
+      return;
+    }
+
+    // Use the first sheet for CSV conversion (deterministic)
+    const firstSheetName = workbook.SheetNames[0];
+    const firstSheet = workbook.Sheets[firstSheetName];
+    clog('Using first sheet for CSV conversion:', firstSheetName);
+
+    // Derive CSV from sheet
+    let csvText;
+    try {
+      csvText = XLSXlib.utils.sheet_to_csv(firstSheet, { FS: ',' });
+      clog('CSV conversion done. CSV length:', csvText.length);
+    } catch (err) {
+      const msg = '<strong>ERROR:</strong> Failed to convert sheet to CSV. Reason: ' + String(err);
+      setStatus(msg, true);
+      console.error(msg, err);
+      return;
+    }
+
+    // Attempt to detect header columns from CSV (first non-empty line)
+    let columns = [];
+    try {
+      const lines = csvText.split(/\r\n|\n/).filter(Boolean);
+      if (lines.length > 0) {
+        const headerLine = lines[0];
+        // Use a robust CSV parse for header (split by comma, but handle quotes)
+        // We'll use a simple regex to split respecting quotes; for robust parsing we rely on SheetJS which already handled data.
+        // Since sheet_to_csv returns well-formed CSV, splitting on commas is acceptable for header extraction when not containing commas.
+        // To be safe, we parse fields using a tiny parser:
+        function parseCsvLine(line) {
+          const fields = [];
+          let cur = '';
+          let inQuotes = false;
+          for (let i = 0; i < line.length; i++) {
+            const ch = line[i];
+            if (ch === '"' ) {
+              if (inQuotes && line[i+1] === '"') { cur += '"'; i++; continue; }
+              inQuotes = !inQuotes;
+              continue;
+            }
+            if (ch === ',' && !inQuotes) {
+              fields.push(cur);
+              cur = '';
+            } else {
+              cur += ch;
+            }
+          }
+          fields.push(cur);
+          return fields;
+        }
+        columns = parseCsvLine(headerLine).map(s => s.trim());
+        clog('Detected header columns:', columns);
+      } else {
+        clog('CSV appears empty after conversion.');
+      }
+    } catch (err) {
+      clog('Failed to determine header columns:', err);
+    }
+
+    // Build status HTML
+    let html = '<p><strong>execute.py:</strong> fetched successfully.</p>';
+    if (hasTypo) {
+      html += `<div style="color:#800;"><strong>Typo detected:</strong> the string "<code>${typo}</code>" was found in execute.py. This must be corrected before committing. A fix can be generated below.</div>`;
+    } else {
+      html += '<div style="color:#064;"><strong>No known typo detected</strong> in execute.py (checked for "<code>revenew</code>").</div>';
+    }
+
+    html += `<p><strong>data.xlsx:</strong> fetched successfully. Sheets: ${workbook.SheetNames.join(', ')}. Using first sheet <em>${firstSheetName}</em> to generate CSV.</p>`;
+    html += `<p><strong>Detected CSV header columns:</strong> ${columns.length ? columns.join(', ') : '<em>none/did not detect</em>'}</p>`;
+
+    if (missingRepoFiles.length > 0) {
+      html += '<div class="small" style="margin-top:8px;"><strong>Repository files missing (you must add these):</strong><ul>';
+      for (const m of missingRepoFiles) {
+        html += `<li>${m.path} — expected by the task but not present in the current repo commit.</li>`;
+      }
+      html += '</ul></div>';
+    } else {
+      html += '<div class="small" style="margin-top:8px; color:#064;"><strong>All expected repository files appear present.</strong></div>';
+    }
+
+    setStatus(html, hasTypo || missingRepoFiles.length > 0);
+
+    // Build actions UI
+    const container = document.createElement('div');
+
+    // Show execute.py preview with line numbers and highlight typo lines
+    const exePreview = document.createElement('div');
+    exePreview.className = 'box';
+    exePreview.innerHTML = '<strong>execute.py preview (first 2000 chars):</strong>';
+    const pre = document.createElement('pre');
+    const previewText = exeText.slice(0, 2000);
+    // add line numbers
+    const lines = previewText.split(/\r\n|\n/);
+    const numbered = lines.map((ln, i) => {
+      const n = (i+1).toString().padStart(3, ' ');
+      if (ln.includes(typo)) return `${n}: ${ln}  <-- contains "${typo}"`;
+      return `${n}: ${ln}`;
+    }).join('\n');
+    pre.textContent = numbered + (exeText.length > 2000 ? '\n... (truncated)' : '');
+    exePreview.appendChild(pre);
+    container.appendChild(exePreview);
+
+    // Button to generate fixed execute.py (replace all occurrences of the typo)
+    const fixBtn = document.createElement('button');
+    fixBtn.textContent = 'Generate fixed execute.py (download)';
+    fixBtn.onclick = () => {
+      const fixed = exeText.split(typo).join('revenue');
+      clog('Generating fixed execute.py (replaced all occurrences of "' + typo + '" with "revenue").');
+      download('execute.py', fixed, 'text/x-python');
+    };
+    container.appendChild(fixBtn);
+
+    // CSV generation button
+    const csvBtn = document.createElement('button');
+    csvBtn.textContent = 'Download generated data.csv (from data.xlsx)';
+    csvBtn.onclick = () => {
+      clog('Providing CSV for download as data.csv; CSV byte-length:', csvText.length);
+      download('data.csv', csvText, 'text/csv');
+    };
+    container.appendChild(csvBtn);
+
+    // Show quick actions to copy content to clipboard (if permitted)
+    const copyExe = document.createElement('button');
+    copyExe.textContent = 'Copy fixed execute.py to clipboard';
+    copyExe.onclick = async () => {
+      try {
+        const fixed = exeText.split(typo).join('revenue');
+        await navigator.clipboard.writeText(fixed);
+        alert('Fixed execute.py copied to clipboard.');
+        clog('Copied fixed execute.py to clipboard.');
+      } catch (err) {
+        alert('Failed to copy to clipboard: ' + err);
+        console.error('Copy to clipboard failed', err);
+      }
+    };
+    container.appendChild(copyExe);
+
+    const copyCsv = document.createElement('button');
+    copyCsv.textContent = 'Copy CSV to clipboard';
+    copyCsv.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(csvText);
+        alert('CSV copied to clipboard.');
+        clog('CSV copied to clipboard (length ' + csvText.length + ').');
+      } catch (err) {
+        alert('Failed to copy to clipboard: ' + err);
+        console.error('Copy CSV to clipboard failed', err);
+      }
+    };
+    container.appendChild(copyCsv);
+
+    // Provide guidance about CI workflow file
+    const guidance = document.createElement('div');
+    guidance.className = 'box small';
+    guidance.innerHTML = '<strong>CI workflow guidance:</strong> The task requires a GitHub Actions workflow at <code>.github/workflows/ci.yml</code> which must:<ul><li>Run <code>ruff</code> and show its output in the CI logs.</li><li>Run <code>python execute.py &gt; result.json</code> (but do not commit result.json).</li><li>Publish <code>result.json</code> via GitHub Pages.</li></ul><div style="color:#800;">This page does not create that workflow automatically — you must add the workflow YAML to the repository. The workflow file was not found in the current commit.</div>';
+    container.appendChild(guidance);
+
+    setActions(container);
+
+    // Final console logs for auditability
+    clog('Audit log:');
+    clog('Attachments used:', ATTACHMENTS);
+    clog('Workbook sheets:', workbook.SheetNames);
+    clog('CSV header columns:', columns);
+    clog('Missing repo files:', missingRepoFiles.map(m => m.path));
+    clog('Typo present in execute.py?', hasTypo);
+
+    // If any checks failing, also console.error detailed info
+    if (hasTypo) {
+      console.error('execute.py contains the string "revenew". This should be replaced (example: "revenue"). Fixed file can be downloaded from the UI.');
+    }
+    if (missingRepoFiles.length > 0) {
+      console.error('Repository is missing required files that the task expects:', missingRepoFiles.map(m => m.path));
+    }
+
+    // If everything looks good (no typo and no missing repo files), show a success message
+    if (!hasTypo && missingRepoFiles.length === 0) {
+      const okNote = document.createElement('div');
+      okNote.className = 'box ok';
+      okNote.innerHTML = '<strong>All checks passed:</strong> execute.py has no known typo and required repo files appear present. Ensure you commit the updated files and push to trigger CI.';
+      actionsEl.prepend(okNote);
+    }
+  }
+
+  main().catch(err => {
+    const msg = 'Unexpected error in inspector: ' + err;
+    setStatus('<strong>ERROR:</strong> ' + msg, true);
+    console.error(msg, err);
+  });
+})();
+  </script>
+</body>
+</html>
